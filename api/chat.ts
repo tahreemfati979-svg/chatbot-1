@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
@@ -5,7 +6,11 @@ const FALLBACK_MODEL = 'gemini-4-hydrogen';
 const SYSTEM_INSTRUCTION =
   'You are Lumina, a fast, helpful, and accurate AI assistant. Give clear, concise answers and use clean Markdown when helpful. If asked for live real-time information (such as current weather, live scores, or breaking news) that you cannot verify, clearly state that you do not have real-time internet access rather than guessing.';
 
-interface IncomingMessage {
+interface VercelRequest extends IncomingMessage {
+  body?: unknown;
+}
+
+interface IncomingChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
@@ -23,6 +28,36 @@ function getAiClient(): GoogleGenAI | null {
       },
     },
   });
+}
+
+function sendJson(res: ServerResponse, status: number, payload: Record<string, unknown>): void {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(payload));
+}
+
+async function readJsonBody(req: VercelRequest): Promise<Record<string, unknown> | null> {
+  if (req.body && typeof req.body === 'object') {
+    return req.body as Record<string, unknown>;
+  }
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  if (chunks.length === 0) return null;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 function parseApiError(err: unknown): { status: number; message: string; code: string } {
@@ -124,12 +159,12 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   throw lastError;
 }
 
-function validateMessages(raw: unknown): IncomingMessage[] | null {
+function validateMessages(raw: unknown): IncomingChatMessage[] | null {
   if (!Array.isArray(raw) || raw.length === 0) {
     return null;
   }
 
-  const sanitized: IncomingMessage[] = [];
+  const sanitized: IncomingChatMessage[] = [];
   for (const item of raw.slice(-20)) {
     if (!item || typeof item !== 'object') return null;
     const role = (item as Record<string, unknown>).role;
@@ -152,45 +187,44 @@ function validateMessages(raw: unknown): IncomingMessage[] | null {
   return sanitized;
 }
 
-function jsonResponse(body: Record<string, unknown>, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
+export default async function handler(req: VercelRequest, res: ServerResponse): Promise<void> {
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
 
-export async function POST(request: Request): Promise<Response> {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { code: 'METHOD_NOT_ALLOWED', error: 'Method not allowed. Use POST.' });
+    return;
+  }
+
   const ai = getAiClient();
   if (!ai) {
-    return jsonResponse(
-      {
-        code: 'MISSING_API_KEY',
-        error:
-          'GEMINI_API_KEY is not configured. Add GEMINI_API_KEY in your environment variables (Vercel Project Settings > Environment Variables or Settings > Secrets).',
-      },
-      503
-    );
+    sendJson(res, 503, {
+      code: 'MISSING_API_KEY',
+      error:
+        'GEMINI_API_KEY is not configured. Add GEMINI_API_KEY in Vercel Project Settings > Environment Variables and redeploy.',
+    });
+    return;
   }
 
-  let body: { messages?: unknown; stream?: boolean } | null = null;
-  try {
-    body = (await request.json()) as { messages?: unknown; stream?: boolean };
-  } catch {
-    return jsonResponse({ code: 'INVALID_JSON', error: 'Invalid JSON request body.' }, 400);
+  const body = await readJsonBody(req);
+  if (!body) {
+    sendJson(res, 400, { code: 'INVALID_JSON', error: 'Invalid JSON request body.' });
+    return;
   }
 
-  const messages = validateMessages(body?.messages);
+  const messages = validateMessages(body.messages);
   if (!messages) {
-    return jsonResponse(
-      {
-        code: 'INVALID_REQUEST',
-        error: 'Please provide a valid non-empty message history ending with a user message.',
-      },
-      400
-    );
+    sendJson(res, 400, {
+      code: 'INVALID_REQUEST',
+      error: 'Please provide a valid non-empty message history ending with a user message.',
+    });
+    return;
   }
 
-  const useStream = body?.stream !== false;
+  const useStream = body.stream !== false;
   const contents = messages.map((msg) => ({
     role: msg.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: msg.content }],
@@ -224,17 +258,26 @@ export async function POST(request: Request): Promise<Response> {
           })
         );
       }
-      return jsonResponse({ text: response.text ?? '' }, 200);
+      sendJson(res, 200, { text: response.text ?? '' });
     } catch (err) {
       const parsed = parseApiError(err);
-      return jsonResponse({ code: parsed.code, error: parsed.message }, parsed.status);
+      sendJson(res, parsed.status, { code: parsed.code, error: parsed.message });
     }
+    return;
   }
 
+  let headersSent = false;
+  let clientClosed = false;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+    }
+  });
+
   try {
-    let geminiStream;
+    let stream;
     try {
-      geminiStream = await withRetry(() =>
+      stream = await withRetry(() =>
         ai.models.generateContentStream({
           model: PRIMARY_MODEL,
           contents,
@@ -247,7 +290,7 @@ export async function POST(request: Request): Promise<Response> {
     } catch (primaryErr) {
       const parsedPrimary = parseApiError(primaryErr);
       if (parsedPrimary.status !== 404) throw primaryErr;
-      geminiStream = await withRetry(() =>
+      stream = await withRetry(() =>
         ai.models.generateContentStream({
           model: FALLBACK_MODEL,
           contents,
@@ -259,46 +302,33 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
-    const encoder = new TextEncoder();
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of geminiStream) {
-            if (request.signal.aborted) {
-              break;
-            }
-            const text = chunk.text;
-            if (text) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`));
-            }
-          }
-          if (!request.signal.aborted) {
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          }
-        } catch (err) {
-          const parsed = parseApiError(err);
-          if (!request.signal.aborted) {
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ error: parsed.message, code: parsed.code })}\n\n`)
-            );
-          }
-        } finally {
-          controller.close();
-        }
-      },
-    });
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    headersSent = true;
 
-    return new Response(readable, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      },
-    });
+    for await (const chunk of stream) {
+      if (clientClosed) break;
+      const text = chunk.text;
+      if (text) {
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+
+    if (!clientClosed) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   } catch (err) {
     const parsed = parseApiError(err);
-    return jsonResponse({ code: parsed.code, error: parsed.message }, parsed.status);
+    if (!headersSent) {
+      sendJson(res, parsed.status, { code: parsed.code, error: parsed.message });
+    } else if (!clientClosed) {
+      res.write(`data: ${JSON.stringify({ error: parsed.message, code: parsed.code })}\n\n`);
+      res.end();
+    }
   }
 }
